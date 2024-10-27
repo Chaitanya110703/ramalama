@@ -52,8 +52,63 @@ class ArgumentParserWithDefaults(argparse.ArgumentParser):
         super().add_argument(*args, **kwargs)
 
 
+def parse_config_file(file_path, config):
+    """Parse a simple TOML-like configuration file."""
+    with open(file_path, "r") as f:
+        for line in f:
+            # Remove comments and whitespace
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            # Parse key-value pairs separated by '='
+            if "=" in line:
+                key, value = map(str.strip, line.split("=", 1))
+                # Convert to appropriate type if possible (bool, int, etc.)
+                if value.lower() in ["true", "false"]:
+                    value = value.lower() == "true"
+                elif value.isdigit():
+                    value = int(value)
+                config[key] = value
+
+    return config
+
+
+def load_config():
+    """Load configuration from a list of paths, in priority order."""
+    config = {}
+    config_paths = [
+        "/usr/share/ramalama/ramalama.conf",
+        "/etc/ramalama/ramalama.conf",
+        os.path.expanduser("~/.config/ramalama/ramalama.conf"),
+    ]
+
+    # Load configuration from each path
+    for path in config_paths:
+        if os.path.isdir(path + ".d"):
+            # Load all .conf files in ramalama.conf.d directory
+            for conf_file in sorted(Path(path + ".d").glob("*.conf")):
+                parse_config_file(conf_file)
+        if os.path.exists(path):
+            # Load the main config file
+            config = parse_config_file(path, config)
+
+    return config
+
+
 def init_cli():
-    description = """\
+    """Initialize the RamaLama CLI and parse command line arguments."""
+    description = get_description()
+    config = load_and_merge_config()
+    parser = create_argument_parser(description, config)
+    configure_subcommands(parser)
+    args = parse_arguments(parser)
+    post_parse_setup(args)
+    return parser, args
+
+
+def get_description():
+    """Return the description of the RamaLama tool."""
+    return """\
 RamaLama tool facilitates local management and serving of AI Models.
 
 On first run RamaLama inspects your system for GPU support, falling back to CPU support if no GPUs are present.
@@ -64,25 +119,47 @@ necessary to run an AI Model for your systems setup.
 Running in containers eliminates the need for users to configure the host system for AI. After the initialization, \
 RamaLama runs the AI Models within a container based on the OCI image.
 
-RamaLama then pulls AI Models from model registires. Starting a chatbot or a rest API service from a simple single \
+RamaLama then pulls AI Models from model registries. Starting a chatbot or a rest API service from a simple single \
 command. Models are treated similarly to how Podman and Docker treat container images.
 
-When both Podman and Docker are installed, RamaLama defaults to Podman, The `RAMALAMA_CONTAINER_ENGINE=docker` \
-environment variable can override this behaviour. When neather are installed RamaLama will attempt to run the model \
+When both Podman and Docker are installed, RamaLama defaults to Podman. The `RAMALAMA_CONTAINER_ENGINE=docker` \
+environment variable can override this behavior. When neither are installed, RamaLama will attempt to run the model \
 with software on the local system.
 """
+
+
+def load_and_merge_config():
+    """Load configuration from files and merge with environment variables."""
+    config = load_config()
+    config['container'] = os.getenv('RAMALAMA_IN_CONTAINER', config.get('container', use_container()))
+    config['engine'] = os.getenv('RAMALAMA_CONTAINER_ENGINE', config.get('engine', container_manager()))
+    config['image'] = os.getenv('RAMALAMA_IMAGE', config.get('image', default_image()))
+    config['nocontainer'] = config.get('nocontainer', False)
+    config['runtime'] = config.get('runtime', 'llama.cpp')
+    config['store'] = os.getenv('RAMALAMA_STORE', config.get('store', get_store()))
+    return config
+
+
+def create_argument_parser(description, config):
+    """Create and configure the argument parser for the CLI."""
     parser = ArgumentParserWithDefaults(
         prog="ramalama",
         description=description,
         formatter_class=argparse.RawTextHelpFormatter,
     )
+    configure_arguments(parser, config)
+    return parser
+
+
+def configure_arguments(parser, config):
+    """Configure the command-line arguments for the parser."""
     parser.add_argument(
         "--container",
         dest="container",
-        default=use_container(),
+        default=config.get("container"),
         action="store_true",
         help="""run RamaLama in the default container.
-The RAMALAMA_IN_CONTAINER environment variable modifies default behaviour.""",
+The RAMALAMA_IN_CONTAINER environment variable modifies default behavior.""",
     )
     parser.add_argument(
         "--debug",
@@ -96,35 +173,41 @@ The RAMALAMA_IN_CONTAINER environment variable modifies default behaviour.""",
     parser.add_argument(
         "--engine",
         dest="engine",
-        default=container_manager(),
+        default=config.get("engine"),
         help="""run RamaLama using the specified container engine.
-The RAMALAMA_CONTAINER_ENGINE environment variable modifies default behaviour.""",
+The RAMALAMA_CONTAINER_ENGINE environment variable modifies default behavior.""",
     )
     parser.add_argument(
         "--image",
-        default=default_image(),
-        help="OCI container image to run with specified AI model",
+        default=config.get("image"),
+        help="OCI container image to run with the specified AI model",
     )
     parser.add_argument(
         "--nocontainer",
         dest="container",
-        default=False,
+        default=config.get("nocontainer"),
         action="store_false",
         help="""do not run RamaLama in the default container.
-The RAMALAMA_IN_CONTAINER environment variable modifies default behaviour.""",
+The RAMALAMA_IN_CONTAINER environment variable modifies default behavior.""",
     )
     parser.add_argument(
         "--runtime",
-        default="llama.cpp",
+        default=config.get("runtime"),
         choices=["llama.cpp", "vllm"],
-        help="specify the runtime to use, valid options are 'llama.cpp' and 'vllm'",
+        help="specify the runtime to use; valid options are 'llama.cpp' and 'vllm'",
     )
-    parser.add_argument("--store", default=get_store(), help="store AI Models in the specified directory")
+    parser.add_argument(
+        "--store",
+        default=config.get("store"),
+        help="store AI Models in the specified directory",
+    )
     parser.add_argument("-v", dest="version", action="store_true", help="show RamaLama version")
 
+
+def configure_subcommands(parser):
+    """Add subcommand parsers to the main argument parser."""
     subparsers = parser.add_subparsers(dest="subcommand")
     subparsers.required = False
-
     help_parser(subparsers)
     containers_parser(subparsers)
     info_parser(subparsers)
@@ -138,18 +221,21 @@ The RAMALAMA_IN_CONTAINER environment variable modifies default behaviour.""",
     serve_parser(subparsers)
     stop_parser(subparsers)
     version_parser(subparsers)
-    # Parse CLI
-    args = parser.parse_args()
 
-    # create stores directories
+
+def parse_arguments(parser):
+    """Parse command line arguments."""
+    return parser.parse_args()
+
+
+def post_parse_setup(args):
+    """Perform additional setup after parsing arguments."""
     mkdirs(args.store)
     if hasattr(args, "MODEL"):
         resolved_model = shortnames.resolve(args.MODEL)
         if resolved_model:
             args.UNRESOLVED_MODEL = args.MODEL
             args.MODEL = resolved_model
-
-    return parser, args
 
 
 def login_parser(subparsers):
